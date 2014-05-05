@@ -167,10 +167,10 @@ module FakeS3
       filename = 'default'
       filename = $1 if request.body =~ /filename="(.*)"/
       key=key.gsub('${filename}', filename)
-      
+
       bucket_obj = @store.get_bucket(s_req.bucket) || @store.create_bucket(s_req.bucket)
       real_obj=@store.store_object(bucket_obj, key, s_req.webrick_request)
-      
+
       response['Etag'] = "\"#{real_obj.md5}\""
       response.body = ""
       if success_action_redirect
@@ -182,7 +182,7 @@ module FakeS3
           response.body= <<-eos.strip
             <?xml version="1.0" encoding="UTF-8"?>
             <PostResponse>
-              <Location>http://#{s_req.bucket}.localhost:#{@port}/#{key}</Location>
+              <Location>http://localhost:#{@port}/#{s_req.bucket}/#{key}</Location>
               <Bucket>#{s_req.bucket}</Bucket>
               <Key>#{key}</Key>
               <ETag>#{response['Etag']}</ETag>
@@ -208,11 +208,11 @@ module FakeS3
       response.status = 204
       response.body = ""
     end
-    
+
     def do_OPTIONS(request, response)
       super
       response["Access-Control-Allow-Origin"]="*"
-    end  
+    end
 
     private
 
