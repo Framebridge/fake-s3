@@ -178,6 +178,7 @@ module FakeS3
           end
         end
         metadata_struct = create_metadata(content,request)
+        metadata_struct[:content_type] = extract_content_type(filedata)
         File.open(metadata,'w') do |f|
           f << YAML::dump(metadata_struct)
         end
@@ -211,13 +212,16 @@ module FakeS3
       end
     end
 
-    def create_metadata(content,request)
+    def create_metadata(content, request)
       metadata = {}
       metadata[:md5] = Digest::MD5.file(content).hexdigest
-      metadata[:content_type] = request.header["content-type"].first
       metadata[:size] = File.size(content)
       metadata[:modified_date] = File.mtime(content).utc.iso8601()
       return metadata
+    end
+
+    def extract_content_type(file_data)
+      file_data["content-type"].to_s
     end
   end
 end
