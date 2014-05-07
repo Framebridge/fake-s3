@@ -221,7 +221,9 @@ module FakeS3
     end
 
     def extract_content_type(file_data)
-      file_data["content-type"].to_s
+      part_content_type = file_data.fetch("file", {})["Content-Type"]
+
+      (!part_content_type.empty? ? part_content_type : file_data["content-type"]).to_s
     end
   end
 end
