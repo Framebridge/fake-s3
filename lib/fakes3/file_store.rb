@@ -280,7 +280,13 @@ module FakeS3
     end
 
     def extract_content_type(file_data)
-      part_content_type = file_data.fetch("file", {})["Content-Type"]
+      # We aren't sure why we had to change the line below.  We think it might
+      # be a different version of webrick in the mix (somehow) or... we made
+      # some change to the code in the merge conflict resolve that we didn't
+      # realize. :-\
+
+      # part_content_type = file_data.fetch("file", {})["Content-Type"]
+      part_content_type = file_data["Content-Type"]
 
       (!part_content_type.empty? ? part_content_type : file_data["content-type"]).to_s
     end
