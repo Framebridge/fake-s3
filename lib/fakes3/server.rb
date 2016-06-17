@@ -258,7 +258,15 @@ module FakeS3
 
         response.body = XmlAdapter.complete_multipart_result real_obj
       elsif request.content_type =~ /^multipart\/form-data; boundary=(.+)/
-        key=request.query['key']
+
+        if query.has_key?("Signature")
+          # This is a presigned URL! The key is in the path.
+          keyparts = request.path.split("/")
+          keyparts.shift(2)
+          key = keyparts.join("/")
+        else
+          key=request.query['key']
+        end
 
         success_action_redirect = request.query['success_action_redirect']
         success_action_status   = request.query['success_action_status']
