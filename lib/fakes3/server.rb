@@ -1,10 +1,15 @@
 require 'time'
 require 'webrick'
+require 'webrick/https'
+require 'openssl'
+require 'securerandom'
+require 'cgi'
 require 'fakes3/file_store'
 require 'fakes3/xml_adapter'
 require 'fakes3/bucket_query'
 require 'fakes3/unsupported_operation'
 require 'fakes3/errors'
+require 'ipaddr'
 
 module FakeS3
   class Request
@@ -48,6 +53,13 @@ module FakeS3
       @root_hostnames = [hostname,'localhost','s3.amazonaws.com','s3.localhost']
     end
 
+    def validate_request(request)
+      req = request.webrick_request
+      return if req.nil?
+      return if not req.header.has_key?('expect')
+      req.continue if req.header['expect'].first=='100-continue'
+    end
+
     def do_GET(request, response)
       s_req = normalize_request(request)
 
@@ -88,6 +100,21 @@ module FakeS3
           return
         end
 
+        if_none_match = request["If-None-Match"]
+        if if_none_match == "\"#{real_obj.md5}\"" or if_none_match == "*"
+          response.status = 304
+          return
+        end
+
+        if_modified_since = request["If-Modified-Since"]
+        if if_modified_since
+          time = Time.httpdate(if_modified_since)
+          if time >= Time.iso8601(real_obj.modified_date)
+            response.status = 304
+            return
+          end
+        end
+
         response.status = 200
         response['Content-Type'] = real_obj.content_type
         stat = File::Stat.new(real_obj.io.path)
@@ -96,6 +123,11 @@ module FakeS3
         response.header['ETag'] = "\"#{real_obj.md5}\""
         response['Accept-Ranges'] = "bytes"
         response['Last-Ranges'] = "bytes"
+        response['Access-Control-Allow-Origin'] = '*'
+
+        real_obj.custom_metadata.each do |header, value|
+          response.header['x-amz-meta-' + header] = value
+        end
 
         content_length = stat.size
 
@@ -131,10 +163,14 @@ module FakeS3
 
     def do_PUT(request,response)
       s_req = normalize_request(request)
+      query = CGI::parse(request.request_uri.query || "")
+
+      return do_multipartPUT(request, response) if query['uploadId'].first
 
       response.status = 200
       response.body = ""
       response['Content-Type'] = "text/xml"
+      response['Access-Control-Allow-Origin'] = '*'
 
       case s_req.type
       when Request::COPY
@@ -154,44 +190,114 @@ module FakeS3
       end
     end
 
+    def do_multipartPUT(request, response)
+      s_req = normalize_request(request)
+      query = CGI::parse(request.request_uri.query)
+
+      part_number   = query['partNumber'].first
+      upload_id     = query['uploadId'].first
+      part_name     = "#{upload_id}_#{s_req.object}_part#{part_number}"
+
+      # store the part
+      if s_req.type == Request::COPY
+        real_obj = @store.copy_object(
+          s_req.src_bucket, s_req.src_object,
+          s_req.bucket    , part_name,
+          request
+        )
+
+        response['Content-Type'] = "text/xml"
+        response.body = XmlAdapter.copy_object_result real_obj
+      else
+        bucket_obj  = @store.get_bucket(s_req.bucket)
+        if !bucket_obj
+          bucket_obj = @store.create_bucket(s_req.bucket)
+        end
+        real_obj    = @store.store_object(
+          bucket_obj, part_name,
+          request
+        )
+
+        response.body   = ""
+        response.header['ETag']  = "\"#{real_obj.md5}\""
+      end
+
+      response['Access-Control-Allow-Origin']   = '*'
+      response['Access-Control-Allow-Headers']  = 'Authorization, Content-Length'
+      response['Access-Control-Expose-Headers'] = 'ETag'
+
+      response.status = 200
+    end
+
     def do_POST(request,response)
-      # check that we've received file data
-      unless request.content_type =~ /^multipart\/form-data; ?boundary=(.+)/
+      s_req = normalize_request(request)
+      key   = request.query['key']
+      query = CGI::parse(request.request_uri.query || "")
+
+      if query.has_key?('uploads')
+        upload_id = SecureRandom.hex
+
+        response.body = <<-eos.strip
+          <?xml version="1.0" encoding="UTF-8"?>
+          <InitiateMultipartUploadResult>
+            <Bucket>#{ s_req.bucket }</Bucket>
+            <Key>#{ key }</Key>
+            <UploadId>#{ upload_id }</UploadId>
+          </InitiateMultipartUploadResult>
+        eos
+      elsif query.has_key?('uploadId')
+        upload_id  = query['uploadId'].first
+        bucket_obj = @store.get_bucket(s_req.bucket)
+        real_obj   = @store.combine_object_parts(
+          bucket_obj,
+          upload_id,
+          s_req.object,
+          parse_complete_multipart_upload(request),
+          request
+        )
+
+        response.body = XmlAdapter.complete_multipart_result real_obj
+      elsif request.content_type =~ /^multipart\/form-data; boundary=(.+)/
+        key=request.query['key']
+
+        success_action_redirect = request.query['success_action_redirect']
+        success_action_status   = request.query['success_action_status']
+
+        filename = 'default'
+        filename = $1 if request.body =~ /filename="(.*)"/
+        key      = key.gsub('${filename}', filename)
+
+        bucket_obj = @store.get_bucket(s_req.bucket) || @store.create_bucket(s_req.bucket)
+        real_obj   = @store.store_object(bucket_obj, key, s_req.webrick_request)
+
+        response['Etag'] = "\"#{real_obj.md5}\""
+
+        if success_action_redirect
+          response.status      = 307
+          response.body        = ""
+          response['Location'] = success_action_redirect
+        else
+          response.status = success_action_status || 204
+          if response.status == "201"
+            response.body = <<-eos.strip
+              <?xml version="1.0" encoding="UTF-8"?>
+              <PostResponse>
+                <Location>http://localhost:#{@port}/#{s_req.bucket}/#{key}</Location>
+                <Bucket>#{s_req.bucket}</Bucket>
+                <Key>#{key}</Key>
+                <ETag>#{response['Etag']}</ETag>
+              </PostResponse>
+            eos
+          end
+        end
+      else
         raise WEBrick::HTTPStatus::BadRequest
       end
-      s_req = normalize_request(request)
-      key=request.query['key']
-      success_action_redirect=request.query['success_action_redirect']
-      success_action_status=request.query['success_action_status']
 
-      filename = 'default'
-      filename = $1 if request.body =~ /filename="(.*)"/
-      key=key.gsub('${filename}', filename)
-
-      bucket_obj = @store.get_bucket(s_req.bucket) || @store.create_bucket(s_req.bucket)
-      real_obj=@store.store_object(bucket_obj, key, s_req.webrick_request)
-
-      response['Etag'] = "\"#{real_obj.md5}\""
-      response.body = ""
-      if success_action_redirect
-        response.status = 307
-        response['Location']=success_action_redirect
-      else
-        response.status = success_action_status || 204
-        if response.status=="201"
-          response.body= <<-eos.strip
-            <?xml version="1.0" encoding="UTF-8"?>
-            <PostResponse>
-              <Location>http://localhost:#{@port}/#{s_req.bucket}/#{key}</Location>
-              <Bucket>#{s_req.bucket}</Bucket>
-              <Key>#{key}</Key>
-              <ETag>#{response['Etag']}</ETag>
-            </PostResponse>
-          eos
-        end
-      end
-      response['Content-Type'] = 'text/xml'
-      response['Access-Control-Allow-Origin']='*'
+      response['Content-Type']                  = 'text/xml'
+      response['Access-Control-Allow-Origin']   = '*'
+      response['Access-Control-Allow-Headers']  = 'Authorization, Content-Length'
+      response['Access-Control-Expose-Headers'] = 'ETag'
     end
 
     def do_DELETE(request,response)
@@ -211,7 +317,10 @@ module FakeS3
 
     def do_OPTIONS(request, response)
       super
-      response["Access-Control-Allow-Origin"]="*"
+      response['Access-Control-Allow-Origin']   = '*'
+      response['Access-Control-Allow-Methods']  = 'PUT, POST, HEAD, GET, OPTIONS'
+      response['Access-Control-Allow-Headers']  = 'Accept, Content-Type, Authorization, Content-Length, ETag'
+      response['Access-Control-Expose-Headers'] = 'ETag'
     end
 
     private
@@ -303,9 +412,11 @@ module FakeS3
         end
       end
 
+      # TODO: also parse the x-amz-copy-source-range:bytes=first-last header
+      # for multipart copy
       copy_source = webrick_req.header["x-amz-copy-source"]
       if copy_source and copy_source.size == 1
-        src_elems = copy_source.first.split("/")
+        src_elems   = copy_source.first.split("/")
         root_offset = src_elems[0] == "" ? 1 : 0
         s_req.src_bucket = src_elems[root_offset]
         s_req.src_object = src_elems[1 + root_offset,src_elems.size].join("/")
@@ -327,6 +438,14 @@ module FakeS3
       s_req.path = webrick_req.query['key']
 
       s_req.webrick_request = webrick_req
+
+      if s_req.is_path_style
+        elems = path[1,path_len].split("/")
+        s_req.bucket = elems[0]
+        s_req.object = elems[1..-1].join('/') if elems.size >= 2
+      else
+        s_req.object = path[1..-1]
+      end
     end
 
     # This method takes a webrick request and generates a normalized FakeS3 request
@@ -338,7 +457,7 @@ module FakeS3
       s_req.path = webrick_req.path
       s_req.is_path_style = true
 
-      if !@root_hostnames.include?(host)
+      if !@root_hostnames.include?(host) && !(IPAddr.new(host) rescue nil)
         s_req.bucket = host.split(".")[0]
         s_req.is_path_style = false
       end
@@ -358,7 +477,24 @@ module FakeS3
         raise "Unknown Request"
       end
 
+      validate_request(s_req)
+
       return s_req
+    end
+
+    def parse_complete_multipart_upload request
+      parts_xml   = ""
+      request.body { |chunk| parts_xml << chunk }
+
+      # TODO: I suck at parsing xml
+      parts_xml = parts_xml.scan /\<Part\>.*?<\/Part\>/m
+
+      parts_xml.collect do |xml|
+        {
+          number: xml[/\<PartNumber\>(\d+)\<\/PartNumber\>/, 1].to_i,
+          etag:   xml[/\<ETag\>\"(.+)\"\<\/ETag\>/, 1]
+        }
+      end
     end
 
     def dump_request(request)
@@ -374,15 +510,30 @@ module FakeS3
 
 
   class Server
-    def initialize(address,port,store,hostname)
+    def initialize(address,port,store,hostname,ssl_cert_path,ssl_key_path)
       @address = address
       @port = port
       @store = store
       @hostname = hostname
+      @ssl_cert_path = ssl_cert_path
+      @ssl_key_path = ssl_key_path
+      webrick_config = {
+        :BindAddress => @address,
+        :Port => @port
+      }
+      if !@ssl_cert_path.to_s.empty?
+        webrick_config.merge!(
+          {
+            :SSLEnable => true,
+            :SSLCertificate => OpenSSL::X509::Certificate.new(File.read(@ssl_cert_path)),
+            :SSLPrivateKey => OpenSSL::PKey::RSA.new(File.read(@ssl_key_path))
+          }
+        )
+      end
+      @server = WEBrick::HTTPServer.new(webrick_config)
     end
 
     def serve
-      @server = WEBrick::HTTPServer.new(:BindAddress => @address, :Port => @port)
       @server.mount "/", Servlet, @store,@hostname
       trap "INT" do @server.shutdown end
       @server.start

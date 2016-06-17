@@ -2,6 +2,7 @@ require 'test/test_helper'
 require 'fileutils'
 #require 'fakes3/server'
 require 'right_aws'
+require 'time'
 
 class RightAWSCommandsTest < Test::Unit::TestCase
 
@@ -52,6 +53,38 @@ class RightAWSCommandsTest < Test::Unit::TestCase
       output << chunk
     end
     assert_equal buf_len,output.size
+  end
+
+  # Test that GET requests with a delimiter return a list of
+  def test_list_by_delimiter
+    @s3.create_bucket("s3media")
+
+    @s3.put("s3media", "delimited/item", "item")
+
+    expected_prefixes = []
+    (1..50).each do |i|
+      key_prefix = "delimited/%02d/" % i
+      @s3.put("s3media", key_prefix + "foo", "foo")
+      @s3.put("s3media", key_prefix + "fie", "fie")
+      expected_prefixes << key_prefix
+    end
+
+    key_names = []
+    common_prefixes = []
+    @s3.incrementally_list_bucket("s3media", {:prefix => "delimited", :delimiter => '/'}) do |currentResponse|
+      common_prefixes += currentResponse[:common_prefixes]
+    end
+    assert_equal ["delimited/"], common_prefixes
+
+    common_prefixes = []
+    @s3.incrementally_list_bucket("s3media", {:prefix => "delimited/", :delimiter => '/', "max-keys" => 5}) do |currentResponse|
+      key_names += currentResponse[:contents].map do |key|
+        key[:key]
+      end
+      common_prefixes += currentResponse[:common_prefixes]
+    end
+    assert_equal expected_prefixes, common_prefixes
+    assert_equal ["delimited/item"], key_names
   end
 
   def test_multi_directory
@@ -115,6 +148,45 @@ class RightAWSCommandsTest < Test::Unit::TestCase
       fail 'Should have caught NoSuchBucket Exception'
     end
 
+  end
+
+  def test_if_none_match
+    @s3.put("s3media","if_none_match_test","Hello World 1!")
+    obj = @s3.get("s3media","if_none_match_test")
+    tag = obj[:headers]["etag"]
+    begin
+      @s3.get("s3media", "if_none_match_test", {"If-None-Match"=>tag})
+    rescue URI::InvalidURIError
+      # expected error for 304
+    else
+      fail 'Should have encountered an error due to the server not returning a response due to caching'
+    end
+    @s3.put("s3media","if_none_match_test","Hello World 2!")
+    obj = @s3.get("s3media", "if_none_match_test", {"If-None-Match"=>tag})
+    assert_equal "Hello World 2!",obj[:object]
+  end
+
+  def test_if_modified_since
+    @s3.put("s3media","if_modified_since_test","Hello World 1!")
+    obj = @s3.get("s3media","if_modified_since_test")
+    modified = obj[:headers]["last-modified"]
+    begin
+      @s3.get("s3media", "if_modified_since_test", {"If-Modified-Since"=>modified})
+    rescue URI::InvalidURIError
+      # expected error for 304
+    else
+      fail 'Should have encountered an error due to the server not returning a response due to caching'
+    end
+    # Granularity of an HTTP Date is 1 second which isn't enough for the test
+    # so manually rewind the clock by a second
+    timeInThePast = Time.httpdate(modified) - 1
+    begin
+      obj = @s3.get("s3media", "if_modified_since_test", {"If-Modified-Since"=>timeInThePast.httpdate()})
+    rescue
+      fail 'Should have been downloaded since the date is in the past now'
+    else
+      #expected scenario
+    end
   end
 
 end
